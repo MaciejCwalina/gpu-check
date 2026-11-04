@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Check a newly bought NVIDIA GPU before confirming the purchase:
+#   1. identity: model, VRAM size, board vendor, PCIe link, VBIOS
+#   2. VRAM stress test with memtest_vulkan (5 minutes by default)
+#   3. temperature, power, clocks and hardware throttling logged during the test
+#   4. kernel errors (NVIDIA Xid, PCIe AER) that appeared during the test
+# Ends with PASS or FAIL per card and saves a report to ~/gpu-checks/.
+#
+# Usage:
+#   gpu-check            test every NVIDIA GPU, one after another
+#   gpu-check 0 2        test only these nvidia-smi indexes
+# Environment:
+#   GPU_CHECK_SECONDS=600              longer stress test (minimum 300)
+#   GPU_CHECK_EXPECTED_NAME="RTX 5060 Ti"
+#   GPU_CHECK_MINIMUM_MEMORY_MIB=16000
+set -euo pipefail
+
+test_seconds=${GPU_CHECK_SECONDS:-300}
+expected_name=${GPU_CHECK_EXPECTED_NAME:-RTX 5060 Ti}
+minimum_memory_mib=${GPU_CHECK_MINIMUM_MEMORY_MIB:-16000}
+maximum_temperature=85
+report_directory="$HOME/gpu-checks"
+telemetry_fields="temperature.gpu,power.draw,clocks.sm,clocks.mem,fan.speed,pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.hw_power_brake_slowdown"
+
+(( test_seconds >= 300 )) || { echo "GPU_CHECK_SECONDS must be at least 300 (memtest_vulkan's standard test)"; exit 1; }
+for tool in nvidia-smi memtest_vulkan script lspci journalctl; do
+    command -v "$tool" >/dev/null || { echo "missing tool: $tool"; exit 1; }
+done
+mkdir -p "$report_directory"
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' green=$'\e[32m' yellow=$'\e[33m' cyan=$'\e[36m' reset=$'\e[0m'
+else
+    bold="" dim="" red="" green="" yellow="" cyan="" reset=""
+fi
+
+field() {  # field <label> <value>
+    printf '%s%-14s%s %s\n' "$dim" "$1" "$reset" "$2" >&3
+}
+
+temperature_color() {  # temperature_color <celsius>
+    if (( $1 <= 75 )); then printf '%s' "$green"
+    elif (( $1 <= maximum_temperature )); then printf '%s' "$yellow"
+    else printf '%s' "$red"; fi
+}
+
+query() {  # query <gpu index> <field>
+    nvidia-smi -i "$1" --query-gpu="$2" --format=csv,noheader,nounits | sed 's/^ *//; s/ *$//'
+}
+
+# memtest_vulkan only reads its device choice from a terminal, so it runs inside `script` (a pseudo-terminal).
+memtest_device_number() {  # memtest_device_number <bus like 01:00>
+    local listing
+    listing=$(timeout 6 script -qfc memtest_vulkan /dev/null < /dev/null 2>&1 | tr -d '\r' || true)
+    grep -aioE "^ *[0-9]+: Bus=0x$1 " <<< "$listing" | grep -oE "^ *[0-9]+" | tr -d ' ' | head -1
+}
+
+check_gpu() {
+    local gpu_index=$1
+    local bus_id name memory_mib vbios power_limit board_vendor short_bus device_number
+    bus_id=$(query "$gpu_index" pci.bus_id)                       # e.g. 00000000:01:00.0
+    short_bus=$(sed -E 's/^[0-9A-Fa-f]+:([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})\..*/\1/' <<< "$bus_id" | tr 'A-F' 'a-f')
+    name=$(query "$gpu_index" name)
+    memory_mib=$(query "$gpu_index" memory.total)
+    vbios=$(query "$gpu_index" vbios_version)
+    power_limit=$(query "$gpu_index" power.default_limit)
+    board_vendor=$(lspci -v -s "$short_bus.0" 2>/dev/null | sed -n 's/^\s*Subsystem: //p' | head -1)
+
+    local stamp report telemetry_file memtest_log
+    stamp=$(date +%Y-%m-%d_%H%M%S)
+    report="$report_directory/${stamp}_gpu${gpu_index}_${short_bus/:/-}.txt"
+    telemetry_file="${report%.txt}.telemetry.csv"
+    memtest_log="${report%.txt}.memtest.log"
+
+    # The terminal gets colors, the saved report gets plain text.
+    exec 3> >(tee >(sed -E 's/\x1b\[[0-9;]*m//g' > "$report"))
+    echo "${bold}${cyan}=== GPU $gpu_index: $name ($bus_id) ===${reset}" >&3
+    field "Board vendor:" "${board_vendor:-unknown}"
+    if (( memory_mib >= minimum_memory_mib )); then
+        field "VRAM:" "${green}$memory_mib MiB${reset}"
+    else
+        field "VRAM:" "${red}$memory_mib MiB${reset}"
+    fi
+    field "VBIOS:" "$vbios"
+    field "Power limit:" "$power_limit W (default)"
+
+    if [[ $(query "$gpu_index" display_active) == "Enabled" ]]; then
+        echo "${yellow}${bold}WARNING:${reset}${yellow} this card drives your display; the desktop will stutter during the test.${reset}" >&3
+        printf 'Continue? [y/N] ' >&3
+        read -r answer
+        [[ $answer == [yY] ]] || { echo "${dim}skipped${reset}" >&3; exec 3>&-; return 0; }
+    fi
+
+    device_number=$(memtest_device_number "$short_bus")
+    if [[ -z $device_number ]]; then
+        echo "${red}${bold}FAIL:${reset}${red} memtest_vulkan does not list a device on bus $short_bus${reset}" >&3
+        exec 3>&-; return 1
+    fi
+
+    field "Stress test:" "memtest_vulkan device $device_number for $test_seconds s ${dim}(log: $memtest_log)${reset}"
+    local started_at
+    started_at=$(date +%s)
+    nvidia-smi -i "$gpu_index" --query-gpu="$telemetry_fields" --format=csv,noheader,nounits -l 5 > "$telemetry_file" &
+    local telemetry_pid=$!
+
+    # Pick the device, let it run, then press Ctrl+C so memtest_vulkan prints its final verdict.
+    { sleep 2; printf '%s\n' "$device_number"; sleep "$test_seconds"; printf '\003'; sleep 5; } \
+        | timeout $(( test_seconds + 30 )) script -qfc memtest_vulkan /dev/null > "$memtest_log" 2>&1 &
+    local test_pid=$!
+    # Live status line on the terminal only (not in the report).
+    while kill -0 "$test_pid" 2>/dev/null; do
+        if [[ -t 1 ]]; then
+            local elapsed=$(( $(date +%s) - started_at )) live_temp live_power live_clock
+            IFS=', ' read -r live_temp live_power live_clock _ <<< "$(tail -1 "$telemetry_file" 2>/dev/null)"
+            printf '\r  %s%d:%02d / %d:%02d%s  %s%s C%s  %s W  %s MHz   ' \
+                "$cyan" $(( elapsed / 60 )) $(( elapsed % 60 )) $(( test_seconds / 60 )) $(( test_seconds % 60 )) "$reset" \
+                "$(temperature_color "${live_temp:-0}")" "${live_temp:--}" "$reset" "${live_power:--}" "${live_clock:--}"
+        fi
+        sleep 5
+    done
+    [[ -t 1 ]] && printf '\r\e[K'
+    wait "$test_pid" || true
+    kill "$telemetry_pid" 2>/dev/null || true
+    sed -i 's/\r//g; s/\x1b\[[0-9;?]*[a-zA-Z]//g' "$memtest_log"
+
+    local tested_line memtest_passed memtest_errors
+    tested_line=$(grep -a "test of" "$memtest_log" | head -1 || true)
+    memtest_passed=$(grep -ac "test PASSed" "$memtest_log" || true)
+    memtest_errors=$(grep -aiE "error" "$memtest_log" | grep -aviE "no any errors" || true)
+
+    local summary maximum_temp maximum_power loaded_minimum_clock maximum_link_gen link_width hardware_throttling
+    summary=$(awk -F', *' '
+        { if ($1+0 > temp) temp = $1+0; if ($2+0 > power) power = $2+0
+          if ($2+0 > 80 && (clock == "" || $3+0 < clock)) clock = $3+0
+          if ($6+0 > gen) { gen = $6+0; width = $7 }
+          if ($8 == "Active" || $9 == "Active" || $10 == "Active") throttled++ }
+        END { printf "%d %.0f %d %d %s %d", temp, power, clock, gen, width, throttled }' "$telemetry_file")
+    read -r maximum_temp maximum_power loaded_minimum_clock maximum_link_gen link_width hardware_throttling <<< "$summary"
+
+    local kernel_errors
+    kernel_errors=$(journalctl -k -q --no-pager --since "@$started_at" 2>/dev/null | grep -E "NVRM: Xid|AER:|PCIe Bus Error" || true)
+
+    field "PCIe link:" "Gen$maximum_link_gen x$link_width under load"
+    field "Max temp:" "$(temperature_color "$maximum_temp")${maximum_temp} C${reset}"
+    field "Max power:" "${maximum_power} W"
+    field "Min clock:" "${loaded_minimum_clock} MHz under load"
+    echo "${dim}Last memtest lines:${reset}" >&3
+    grep -a "iteration" "$memtest_log" | tail -2 | sed "s/^/    ${dim}/; s/\$/${reset}/" >&3
+
+    local failures=()
+    [[ $name == *"$expected_name"* ]] || failures+=("name is '$name', expected '$expected_name'")
+    (( memory_mib >= minimum_memory_mib )) || failures+=("only $memory_mib MiB VRAM (expected >= $minimum_memory_mib)")
+    [[ $tested_line == *"Bus=0x$short_bus"* ]] || failures+=("memtest_vulkan tested the wrong device: $tested_line")
+    (( memtest_passed > 0 )) || failures+=("memtest_vulkan did not report PASS")
+    [[ -z $memtest_errors ]] || failures+=("memtest_vulkan reported errors: $(head -3 <<< "$memtest_errors")")
+    (( maximum_temp <= maximum_temperature )) || failures+=("temperature reached ${maximum_temp} C (limit $maximum_temperature)")
+    (( hardware_throttling == 0 )) || failures+=("hardware throttling (slowdown/thermal/power brake) seen in $hardware_throttling samples")
+    [[ -z $kernel_errors ]] || failures+=("kernel errors: $(head -3 <<< "$kernel_errors")")
+
+    if (( ${#failures[@]} == 0 )); then
+        field "RESULT:" "${green}${bold}PASS${reset}"
+    else
+        field "RESULT:" "${red}${bold}FAIL${reset}"
+        printf "    ${red}- %s${reset}\n" "${failures[@]}" >&3
+    fi
+    field "Report:" "$report"
+    exec 3>&-
+    (( ${#failures[@]} == 0 ))
+}
+
+if (( $# > 0 )); then
+    gpu_indexes=("$@")
+else
+    mapfile -t gpu_indexes < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+fi
+(( ${#gpu_indexes[@]} > 0 )) || { echo "nvidia-smi sees no GPUs (driver not loaded? 5060 Ti needs the open kernel module)"; exit 1; }
+
+overall=0
+for gpu_index in "${gpu_indexes[@]}"; do
+    check_gpu "$gpu_index" || overall=1
+    echo
+done
+exit $overall
